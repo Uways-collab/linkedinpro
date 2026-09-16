@@ -1,0 +1,102 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Registered user profile in the application",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Unique identifier of the user matching Firebase Auth UID"
+        },
+        "email": {
+          "type": "string",
+          "description": "Email address of the user"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp when the user account was created"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp of latest profile update"
+        }
+      },
+      "required": ["userId", "email", "createdAt"]
+    },
+    "SavedAnalysis": {
+      "title": "SavedAnalysis",
+      "description": "Stored profile analysis report associated with an authenticated user",
+      "type": "object",
+      "properties": {
+        "analysisId": {
+          "type": "string",
+          "description": "Unique identifier of the saved analysis"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner"
+        },
+        "title": {
+          "type": "string",
+          "description": "Descriptive title for the saved analysis (e.g. target role or name)"
+        },
+        "targetRole": {
+          "type": "string",
+          "description": "Target job or executive role"
+        },
+        "targetGoal": {
+          "type": "string",
+          "description": "Target career or business goal"
+        },
+        "targetIndustry": {
+          "type": "string",
+          "description": "Target industry"
+        },
+        "score": {
+          "type": "number",
+          "description": "Overall audit score (0-100)"
+        },
+        "originalText": {
+          "type": "string",
+          "description": "Original raw profile content inputted by the user"
+        },
+        "profileUrl": {
+          "type": "string",
+          "description": "Optional original profile URL"
+        },
+        "report": {
+          "type": "object",
+          "description": "Full structured AuditReport data payload"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp when saved"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp when updated"
+        }
+      },
+      "required": ["analysisId", "userId", "title", "report", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile document keyed by auth UID"
+    },
+    "/users/{userId}/savedAnalyses/{analysisId}": {
+      "schema": "SavedAnalysis",
+      "description": "Collection of saved profile analyses for a specific authenticated user"
+    }
+  }
+}

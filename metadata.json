@@ -1,0 +1,6 @@
+{
+  "name": "LinkedIn Profile Pro",
+  "description": "Professional LinkedIn profile document audit application analyzing only verified uploaded document records to provide rigorous keep, improve, add, remove, and rewrite guidance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

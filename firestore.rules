@@ -1,0 +1,51 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidUser(data, userId) {
+      return data.userId == userId &&
+             data.email is string &&
+             data.email.size() > 3 &&
+             data.createdAt is string;
+    }
+
+    function isValidSavedAnalysis(data, userId, analysisId) {
+      return data.userId == userId &&
+             data.analysisId == analysisId &&
+             data.title is string &&
+             data.title.size() > 0 &&
+             data.title.size() <= 200 &&
+             data.report is map &&
+             data.createdAt is string;
+    }
+
+    // User document rules: only the authenticated user can access their own document
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data, userId);
+      allow delete: if isOwner(userId);
+
+      // Subcollection: Saved Analyses
+      match /savedAnalyses/{analysisId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidSavedAnalysis(request.resource.data, userId, analysisId);
+        allow update: if isOwner(userId) && isValidSavedAnalysis(request.resource.data, userId, analysisId);
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
