@@ -3,20 +3,22 @@ import express, { Request, Response } from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import { extractDocumentText } from "./server/documentAuditor";
+import { generateMarkdownReport, generatePlainTextReport } from "./server/careerReportGenerator";
+import { fetchAndAnalyzeProfileUrl } from "./server/urlProfileFetcher";
 import {
-  extractDocumentText,
-  buildMarkdownReport,
-  buildPlainTextReport,
-  generateStrictHeuristicAudit,
-} from "./server/documentAuditor";
-import { AuditReport } from "./src/types";
+  ComprehensiveInput,
+  CareerPortfolioAuditResult,
+  PlatformType,
+  ConnectedAccountState,
+} from "./src/types";
 
 const app = express();
 const PORT = 3000;
 
-// Body parser with 30mb limit for PDF/document uploads
-app.use(express.json({ limit: "30mb" }));
-app.use(express.urlencoded({ extended: true, limit: "30mb" }));
+// Body parser with 35mb limit
+app.use(express.json({ limit: "35mb" }));
+app.use(express.urlencoded({ extended: true, limit: "35mb" }));
 
 // Lazy initialization of Gemini API client
 let aiClient: GoogleGenAI | null = null;
@@ -38,7 +40,6 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Model candidates in order of preference
 const CANDIDATE_MODELS = [
   "gemini-3.8-flash",
   "gemini-flash-latest",
@@ -47,15 +48,13 @@ const CANDIDATE_MODELS = [
 
 async function callGeminiWithFallback(ai: GoogleGenAI, requestPayload: any): Promise<any> {
   let lastError: any = null;
-
   for (let i = 0; i < CANDIDATE_MODELS.length; i++) {
     const model = CANDIDATE_MODELS[i];
     try {
-      const response = await ai.models.generateContent({
+      return await ai.models.generateContent({
         ...requestPayload,
         model,
       });
-      return response;
     } catch (err: any) {
       lastError = err;
       const errMsg = err?.message || String(err);
@@ -74,7 +73,6 @@ async function callGeminiWithFallback(ai: GoogleGenAI, requestPayload: any): Pro
       break;
     }
   }
-
   throw lastError;
 }
 
@@ -82,216 +80,258 @@ async function callGeminiWithFallback(ai: GoogleGenAI, requestPayload: any): Pro
 app.get("/api/health", (_req, res) => {
   res.json({
     status: "healthy",
-    service: "LinkedIn Profile Pro Audit Service",
+    service: "Career Portfolio Pro Audit & Publishing Service",
     timestamp: new Date().toISOString(),
-    primarySourceOfTruth: "Uploaded document exclusively",
+    strictSourceOfTruthEnforced: true,
   });
 });
 
-// Document verification endpoint
-app.post("/api/verify-document", async (req: Request, res: Response) => {
+// Single file text extraction and validation
+app.post("/api/extract-file", async (req: Request, res: Response) => {
   try {
-    const { uploadedFileName, uploadedFileType, uploadedFileBase64 } = req.body || {};
-
-    if (!uploadedFileName || !uploadedFileBase64) {
-      res.status(400).json({
-        valid: false,
-        error: "Please upload your LinkedIn profile document before starting the analysis. This application analyzes only the information contained in the uploaded document.",
-      });
+    const { name, type, base64 } = req.body || {};
+    if (!name || !base64) {
+      res.status(400).json({ error: "Missing file payload." });
       return;
     }
 
-    const buffer = Buffer.from(uploadedFileBase64, "base64");
+    const buffer = Buffer.from(base64, "base64");
     if (buffer.length === 0) {
-      res.status(400).json({
-        valid: false,
-        error: "I could not read this document. Please upload a clear PDF, DOCX, or TXT file containing your LinkedIn profile.",
-      });
+      res.status(400).json({ error: "I could not read this file. Please upload a clearer PDF, DOCX, TXT, JPG, or PNG file." });
       return;
     }
 
-    const extractedText = await extractDocumentText(
-      uploadedFileName,
-      uploadedFileType || "",
-      buffer
-    );
+    const lowerName = (name || "").toLowerCase();
+    const isImage = lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") || lowerName.endsWith(".png") || (type || "").startsWith("image/");
+    const isPdf = lowerName.endsWith(".pdf") || type === "application/pdf";
 
-    const isPdf = /\.pdf$/i.test(uploadedFileName) || uploadedFileType === "application/pdf";
-    const readable = extractedText.trim().length > 10 || isPdf;
+    let extractedText = await extractDocumentText(name, type || "", buffer);
 
-    if (!readable) {
+    // If it's an image or image-based PDF and text is empty, OCR via Gemini Vision
+    if ((isImage || (isPdf && extractedText.trim().length < 20))) {
+      try {
+        const ai = getGeminiClient();
+        const mime = isImage ? (type || "image/png") : "application/pdf";
+        const visionResp = await callGeminiWithFallback(ai, {
+          contents: [
+            {
+              inlineData: {
+                mimeType: mime,
+                data: base64,
+              },
+            },
+            {
+              text: "Transcribe all visible text from this professional profile document/screenshot verbatim. Do not interpret, summarize, or invent missing text.",
+            },
+          ],
+        });
+        const ocrText = visionResp?.text?.trim();
+        if (ocrText && ocrText.length > 10) {
+          extractedText = ocrText;
+        }
+      } catch (ocrErr: any) {
+        console.warn("OCR fallback note:", ocrErr?.message);
+      }
+    }
+
+    if (extractedText.trim().length < 5 && !isPdf && !isImage) {
       res.status(400).json({
-        valid: false,
-        error: "I could not read this document. Please upload a clear PDF, DOCX, or TXT file containing your LinkedIn profile.",
+        error: "I could not read this file. Please upload a clearer PDF, DOCX, TXT, JPG, or PNG file.",
       });
       return;
     }
-
-    const wordCount = extractedText.trim() ? extractedText.trim().split(/\s+/).length : 0;
 
     res.json({
-      valid: true,
-      filename: uploadedFileName,
-      fileType: uploadedFileType || (isPdf ? "application/pdf" : "text/plain"),
-      fileSize: buffer.length,
-      wordCount,
-      preview: extractedText.slice(0, 300),
-      message: "Document successfully read and validated against the source-of-truth requirement.",
+      success: true,
+      filename: name,
+      extractedText: extractedText.trim(),
+      charCount: extractedText.length,
     });
   } catch (err: any) {
     res.status(400).json({
-      valid: false,
-      error: "I could not read this document. Please upload a clear PDF, DOCX, or TXT file containing your LinkedIn profile.",
+      error: "I could not read this file. Please upload a clearer PDF, DOCX, TXT, JPG, or PNG file.",
     });
   }
 });
 
-// Main Analysis Endpoint
-app.post("/api/analyze-profile", async (req: Request, res: Response) => {
-  const input = req.body || {};
+// Inspect single profile URL endpoint for live preview/verification
+app.post("/api/inspect-profile-url", async (req: Request, res: Response) => {
+  try {
+    const { url } = req.body || {};
+    if (!url || typeof url !== "string" || !url.trim().startsWith("http")) {
+      res.status(400).json({ error: "Please enter a valid URL starting with http:// or https://" });
+      return;
+    }
+
+    const ai = getGeminiClient();
+    const result = await fetchAndAnalyzeProfileUrl(ai, url.trim());
+    res.json({ success: true, profileData: result });
+  } catch (err: any) {
+    console.error("Inspect profile URL error:", err);
+    res.status(500).json({ error: err?.message || "Failed to inspect profile URL." });
+  }
+});
+
+// Main Career Portfolio Pro Audit Endpoint
+app.post("/api/analyze-portfolio", async (req: Request, res: Response) => {
+  const payload: ComprehensiveInput = req.body;
 
   try {
-    const {
-      profileUrl,
-      uploadedFileName,
-      uploadedFileType,
-      uploadedFileBase64,
-      targetGoal,
-      targetRole,
-      targetIndustry,
-    } = input;
+    const { mode, uploadedFiles = [], pastedTexts = [], profileUrl, optionalProfileUrl, goals } = payload;
+    const effectiveProfileUrl = (profileUrl || optionalProfileUrl || "").trim();
 
-    // STRICT RULE 1: If no document has been uploaded, do not generate an analysis.
-    if (!uploadedFileName || !uploadedFileBase64) {
+    // Strict Rule: At least one source must be present: uploaded document, pasted content, or profile URL
+    const hasUpload = uploadedFiles.length > 0 && uploadedFiles.some((f) => (f.extractedText && f.extractedText.trim().length > 0) || f.base64);
+    const hasPasted = pastedTexts.length > 0 && pastedTexts.some((p) => p.content && p.content.trim().length > 0);
+    const hasProfileUrl = effectiveProfileUrl.length > 0;
+
+    if (!hasUpload && !hasPasted && !hasProfileUrl) {
       res.status(400).json({
-        error: "Please upload your LinkedIn profile document before starting the analysis. This application analyzes only the information contained in the uploaded document.",
-      });
-      return;
-    }
-
-    let buffer: Buffer;
-    try {
-      buffer = Buffer.from(uploadedFileBase64, "base64");
-      if (buffer.length === 0) {
-        throw new Error("Empty buffer");
-      }
-    } catch {
-      res.status(400).json({
-        error: "I could not read this document. Please upload a clear PDF, DOCX, or TXT file containing your LinkedIn profile.",
-      });
-      return;
-    }
-
-    // STRICT RULE 2: If the uploaded document cannot be read, display specific message
-    const isPdf = /\.pdf$/i.test(uploadedFileName) || uploadedFileType === "application/pdf";
-    const extractedFileText = await extractDocumentText(uploadedFileName, uploadedFileType || "", buffer);
-
-    if (!isPdf && extractedFileText.trim().length < 5) {
-      res.status(400).json({
-        error: "I could not read this document. Please upload a clear PDF, DOCX, or TXT file containing your LinkedIn profile.",
+        error: "Please provide your profile URL, upload a document, or paste your profile content before starting the analysis.",
       });
       return;
     }
 
     const ai = getGeminiClient();
 
-    // Prepare PDF inline part if it's a PDF
-    let pdfInlinePart: { inlineData: { mimeType: string; data: string } } | null = null;
-    if (isPdf) {
-      pdfInlinePart = {
-        inlineData: {
-          mimeType: "application/pdf",
-          data: uploadedFileBase64,
-        },
-      };
+    // If profile URL was provided, fetch and inspect the profile live so the AI knows exactly what's on their profile
+    let urlProfileResult: any = null;
+    if (hasProfileUrl) {
+      try {
+        urlProfileResult = await fetchAndAnalyzeProfileUrl(ai, effectiveProfileUrl);
+      } catch (urlErr) {
+        console.warn("Failed to fetch profile URL content:", urlErr);
+      }
     }
 
-    const systemInstruction = `You are the lead auditor for "LinkedIn Profile Pro".
-You analyze an uploaded LinkedIn profile document with 100% adherence to the STRICT SOURCE-OF-TRUTH RULE:
+    // Build context strings from approved sources
+    let sourcesListDescription = "";
+    const inlineParts: any[] = [];
 
-STRICT SOURCE-OF-TRUTH RULE:
-The uploaded document is the ONLY permitted source of information.
-You must use exactly and only the information contained in the uploaded document. You MUST NOT use:
+    // 1. Uploaded Documents
+    if (uploadedFiles.length > 0) {
+      sourcesListDescription += `\n### USER UPLOADED DOCUMENTS:\n`;
+      for (const file of uploadedFiles) {
+        sourcesListDescription += `\n--- Document: ${file.name} (Category: ${file.category}) ---\n`;
+        if (file.extractedText) {
+          sourcesListDescription += `${file.extractedText}\n`;
+        } else if (file.base64 && file.type === "application/pdf") {
+          inlineParts.push({
+            inlineData: {
+              mimeType: "application/pdf",
+              data: file.base64,
+            },
+          });
+        }
+      }
+    }
+
+    // 2. Pasted Content
+    if (pastedTexts.length > 0) {
+      sourcesListDescription += `\n### USER PASTED CONTENT:\n`;
+      for (const item of pastedTexts) {
+        sourcesListDescription += `\n--- Pasted Item: ${item.title} (${item.category}) ---\n${item.content}\n`;
+      }
+    }
+
+    // 3. User-Provided Profile URL (Inspected Live Content)
+    if (hasProfileUrl) {
+      sourcesListDescription += `\n### USER-PROVIDED PROFILE URL & LIVE INSPECTED CONTENT:\n`;
+      sourcesListDescription += `URL: ${effectiveProfileUrl}\n`;
+      if (urlProfileResult) {
+        sourcesListDescription += `Platform: ${urlProfileResult.platform}\n`;
+        sourcesListDescription += `Retrieval Status: ${urlProfileResult.fetchStatus} (${urlProfileResult.fetchNotes || ""})\n`;
+        if (urlProfileResult.rawTextExcerpt) {
+          sourcesListDescription += `Profile Content Extracted from URL:\n${urlProfileResult.rawTextExcerpt}\n`;
+        }
+      }
+    }
+
+    // Goal parameters
+    const userGoalsDescription = `
+User Goals & Context (Only use if explicitly relevant to position user's verified facts):
+- Primary Goal: ${goals?.primaryGoal || "Improve professional credibility"}
+${goals?.targetRole ? `- Target Role: ${goals.targetRole}` : ""}
+${goals?.targetIndustry ? `- Target Industry: ${goals.targetIndustry}` : ""}
+${goals?.targetAudience ? `- Target Audience: ${goals.targetAudience}` : ""}
+${goals?.location ? `- Location: ${goals.location}` : ""}
+${goals?.preferredTone ? `- Preferred Tone: ${goals.preferredTone}` : ""}
+${goals?.brandOrCompany ? `- Brand or Company: ${goals.brandOrCompany}` : ""}
+`;
+
+    const systemInstruction = `You are the lead auditor and precision editor for "Career Portfolio Pro".
+You operate under the following unbreakable policies:
+
+==================================================
+STRICT SOURCE-OF-TRUTH POLICY
+==================================================
+The AI must use only information from one of these approved sources:
+1. The user-provided profile URL and its verified public content (LinkedIn, GitHub, Portfolio, Twitter, Instagram, etc.)
+2. An uploaded document supplied by the user (CV, Resume, PDF, DOCX, Export)
+3. Text manually pasted by the user
+4. Information explicitly entered by the user during the current session
+
+The AI MUST NOT use:
 - Mock data
-- Example data
-- Placeholder facts presented as real facts
-- External websites
-- LinkedIn profile scraping
-- Search engines
-- Public LinkedIn profile information
-- Information from the user's URL that is not present in the uploaded document
-- Assumptions about the user
-- Guessed job responsibilities
-- Guessed achievements
-- Guessed dates
-- Guessed employers
-- Guessed education
-- Guessed certifications
-- Guessed skills
-- Guessed metrics
-- Guessed clients, customers, users, revenue, results, or partnerships
-- Any information from previous analyses or previous users
+- Example profile data
+- Fake names
+- Fake companies
+- Fake job titles
+- Fake achievements
+- Fake metrics
+- Fake followers, likes, views, impressions
+- Fake clients
+- Fake projects
+- Fake education
+- Fake certifications
+- Fake recommendations
+- Guessed information
+- Information from previous users
+- Unrelated external search results
 
-The uploaded document must be treated as the complete and authoritative profile record.
-If a LinkedIn profile URL is provided, display it only as a reference. Do not open it, scrape it, analyze it, or use any information from it. The analysis must still be based exclusively on the uploaded document.
+If a fact is not available from an approved source or the profile URL, write:
+"Not provided by the provided profile URL or uploaded document."
 
-If the document is incomplete, analyze only the available information and clearly state what is missing. Never fill missing information with invented or sample content.
+Never invent missing information.
+If a bullet point lacks measurable evidence, write: "No measurable result is included in the source document."
 
-FACTUAL ACCURACY RULES:
-Every factual statement in the analysis must be directly traceable to text in the uploaded document.
-Before displaying any recommendation, classify it internally as one of the following:
-1. "Directly supported by the document"
-2. "A writing or formatting recommendation based on the document"
-3. "Missing information that the user may optionally add later"
+If two sources conflict, do not choose one automatically. Write:
+"These sources contain conflicting information. Please confirm which version is accurate."
+Never resolve conflicts by guessing.
 
-Only categories 1 and 2 may be written as current profile facts.
-Category 3 must be clearly labeled as missing information. Do not present it as true.
-For example, if the uploaded document does not contain a number of customers, never write "Managed 500 customers." Instead write: "No customer count is provided in the uploaded document. Add one only if it is accurate."
-Do not create realistic-looking examples using the user's name, company, job title, or industry. Do not use fake sample achievements in the final analysis.
+Separate MODES:
+1. ANALYSIS AND DRAFTING MODE (The current output)
+2. CONNECTED ACCOUNT UPDATE MODE (Handled after explicit user approval)
+The application must never confuse a draft recommendation with a published update.
 
-OUTPUT REQUIREMENTS:
-Follow the exact sections requested:
-1. sourceIntegrity: statement must be: "This analysis is based exclusively on the uploaded document. No external LinkedIn data, mock data, assumptions, or unverified information was used." Include documentFilename, documentType, whether successfully read, sections found, information not found.
-2. executiveSummary: score (0-100 evaluating writing quality, clarity, completeness, presentation, not predicting employment or networking results), exactly 3 strengths supported by doc, exactly 3 improvement priorities, one concise positioning statement using only doc info, scoreDisclaimer: "This score evaluates writing quality, clarity, completeness, and presentation. It must not predict employment, business, or networking results."
-3. factsFound: Name, Headline, Location, Contact information, About or Summary, Companies, Job titles, Dates, Locations, Skills, Certifications, Education, Other sections. If missing write: "Not provided in the uploaded document."
-4. keep: List only elements that should remain because they are clear, relevant, or useful according to the document.
-5. improve: For every recommendation include: existingWording, problemIdentified, whyItMatters, recommendedRevision, classification.
-6. removeOrReplace: Exact wording from doc, reason, replacement wording (or "No replacement can be created without additional information from the user.")
-7. headlineRecommendations: Up to 3 options using ONLY facts explicitly found in doc. If not enough info state: "The uploaded document does not contain enough verified information to create three distinct headline options."
-8. rewrittenAbout: Copy-ready About using only info from doc. Do not add new achievements, metrics, responsibilities, or claims. Missing details listed as "Information not provided in the uploaded document."
-9. experienceRewrites: For every role found: exact company name, exact job title, exact dates, copy-ready version rewriting only supported info, missingInformation listing details not included. Never invent missing details.
-10. skillsReview: Skills explicitly present in document, skills unclear or need verification, notAvailableNotice: "No additional skills can be recommended unless they are supported by the uploaded document."
-11. certificationReview: List only certifications shown. Missing issuer/date/credential: "Not provided in the uploaded document."
-12. documentContentSuggestions: Up to 3 topics using only subjects, roles, skills, or experiences in document. Do not invent events, opinions, or achievements.
-13. finalAccuracyChecklist: Verify Name, Job titles, Company names, Dates, Locations, Skills, Certifications, Contact details, Claims, Grammar edits, Any suggested wording.
-14. finalResponseStatement: "Before publishing, verify every edited sentence against your real experience. This report does not add or confirm information that was not present in the uploaded document."`;
+PLATFORM CHARACTER CONSTRAINTS:
+- LinkedIn Headline: max 220 chars
+- LinkedIn About: max 2600 chars
+- Instagram Display Name: max 30 chars
+- Instagram Bio: max 150 chars
+- Twitter Display Name: max 50 chars
+- Twitter Bio: max 160 chars
+- TikTok Display Name: max 30 chars
+- TikTok Bio: max 80 chars
+- GitHub Bio: max 160 chars
 
-    const userPromptText = `Audit this uploaded LinkedIn profile document.
+OUTPUT JSON SPECIFICATION:
+Return valid JSON matching the exact required schema.`;
 
-DOCUMENT METADATA:
-- Filename: ${uploadedFileName}
-- Type: ${uploadedFileType || "Document"}
-${profileUrl ? `- LinkedIn Profile URL (REFERENCE ONLY - DO NOT SCRAPE OR USE FOR ANALYSIS): ${profileUrl}` : ""}
-${targetGoal ? `- User's optimization target: ${targetGoal}` : ""}
-${targetRole ? `- User's target role context: ${targetRole}` : ""}
-${targetIndustry ? `- User's target industry context: ${targetIndustry}` : ""}
+    const promptText = `Analyze and prepare copy-ready improvements for the provided profile sources adhering strictly to the Strict Source-of-Truth Policy:
 
-EXTRACTED DOCUMENT TEXT:
-${extractedFileText || "(Attached as inline PDF document)"}
+${sourcesListDescription}
+${userGoalsDescription}
 
-Perform the full audit with 100% adherence to the STRICT SOURCE-OF-TRUTH RULE.`;
+Generate the comprehensive analysis and draft recommendations strictly based on these verified facts.`;
 
-    const contents: any[] = [];
-    if (pdfInlinePart) {
-      contents.push(pdfInlinePart);
-    }
-    contents.push({ text: userPromptText });
+    const contents: any[] = [...inlineParts, { text: promptText }];
 
     const response = await callGeminiWithFallback(ai, {
       contents,
       config: {
         systemInstruction,
-        temperature: 0.1, // Zero creativity/hallucination
+        temperature: 0.1,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -300,71 +340,42 @@ Perform the full audit with 100% adherence to the STRICT SOURCE-OF-TRUTH RULE.`;
               type: Type.OBJECT,
               properties: {
                 statement: { type: Type.STRING },
-                documentFilename: { type: Type.STRING },
-                documentType: { type: Type.STRING },
-                successfullyRead: { type: Type.BOOLEAN },
+                sourcesAnalyzed: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      name: { type: Type.STRING },
+                      type: { type: Type.STRING },
+                      platform: { type: Type.STRING },
+                      status: { type: Type.STRING },
+                      details: { type: Type.STRING },
+                    },
+                    required: ["name", "type", "status"],
+                  },
+                },
+                sourcesNotAccessible: { type: Type.ARRAY, items: { type: Type.STRING } },
                 sectionsFound: { type: Type.ARRAY, items: { type: Type.STRING } },
-                informationNotFound: { type: Type.ARRAY, items: { type: Type.STRING } },
-                profileUrlReference: { type: Type.STRING },
+                missingInformation: { type: Type.ARRAY, items: { type: Type.STRING } },
+                conflictingInformation: { type: Type.ARRAY, items: { type: Type.STRING } },
               },
-              required: [
-                "statement",
-                "documentFilename",
-                "documentType",
-                "successfullyRead",
-                "sectionsFound",
-                "informationNotFound",
-              ],
+              required: ["statement", "sourcesAnalyzed", "sectionsFound", "missingInformation", "conflictingInformation"],
             },
             executiveSummary: {
               type: Type.OBJECT,
               properties: {
-                score: { type: Type.INTEGER },
-                strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                improvementPriorities: { type: Type.ARRAY, items: { type: Type.STRING } },
-                positioningStatement: { type: Type.STRING },
+                overallScore: { type: Type.INTEGER },
                 scoreDisclaimer: { type: Type.STRING },
+                threeStrongestAreas: { type: Type.ARRAY, items: { type: Type.STRING } },
+                threePriorityImprovements: { type: Type.ARRAY, items: { type: Type.STRING } },
+                verifiedPositioningStatement: { type: Type.STRING },
+                mostImportantNextAction: { type: Type.STRING },
               },
-              required: [
-                "score",
-                "strengths",
-                "improvementPriorities",
-                "positioningStatement",
-                "scoreDisclaimer",
-              ],
+              required: ["overallScore", "threeStrongestAreas", "threePriorityImprovements", "verifiedPositioningStatement", "mostImportantNextAction"],
             },
-            factsFound: {
+            sourceBySourceReviews: {
               type: Type.OBJECT,
-              properties: {
-                name: { type: Type.STRING },
-                headline: { type: Type.STRING },
-                location: { type: Type.STRING },
-                contactInformation: { type: Type.STRING },
-                aboutOrSummary: { type: Type.STRING },
-                companies: { type: Type.ARRAY, items: { type: Type.STRING } },
-                jobTitles: { type: Type.ARRAY, items: { type: Type.STRING } },
-                dates: { type: Type.ARRAY, items: { type: Type.STRING } },
-                locations: { type: Type.ARRAY, items: { type: Type.STRING } },
-                skills: { type: Type.ARRAY, items: { type: Type.STRING } },
-                certifications: { type: Type.ARRAY, items: { type: Type.STRING } },
-                education: { type: Type.ARRAY, items: { type: Type.STRING } },
-                otherSections: { type: Type.ARRAY, items: { type: Type.STRING } },
-              },
-              required: [
-                "name",
-                "headline",
-                "location",
-                "contactInformation",
-                "aboutOrSummary",
-                "companies",
-                "jobTitles",
-                "dates",
-                "locations",
-                "skills",
-                "certifications",
-                "education",
-                "otherSections",
-              ],
+              description: "Map of platform keys to platform reviews",
             },
             keep: {
               type: Type.ARRAY,
@@ -372,9 +383,10 @@ Perform the full audit with 100% adherence to the STRICT SOURCE-OF-TRUTH RULE.`;
                 type: Type.OBJECT,
                 properties: {
                   element: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
+                  source: { type: Type.STRING },
+                  justification: { type: Type.STRING },
                 },
-                required: ["element", "explanation"],
+                required: ["element", "source", "justification"],
               },
             },
             improve: {
@@ -383,18 +395,12 @@ Perform the full audit with 100% adherence to the STRICT SOURCE-OF-TRUTH RULE.`;
                 type: Type.OBJECT,
                 properties: {
                   existingWording: { type: Type.STRING },
-                  problemIdentified: { type: Type.STRING },
+                  problem: { type: Type.STRING },
                   whyItMatters: { type: Type.STRING },
-                  recommendedRevision: { type: Type.STRING },
-                  classification: { type: Type.STRING },
+                  copyReadyImprovement: { type: Type.STRING },
+                  sourceSupporting: { type: Type.STRING },
                 },
-                required: [
-                  "existingWording",
-                  "problemIdentified",
-                  "whyItMatters",
-                  "recommendedRevision",
-                  "classification",
-                ],
+                required: ["existingWording", "problem", "whyItMatters", "copyReadyImprovement", "sourceSupporting"],
               },
             },
             removeOrReplace: {
@@ -402,164 +408,158 @@ Perform the full audit with 100% adherence to the STRICT SOURCE-OF-TRUTH RULE.`;
               items: {
                 type: Type.OBJECT,
                 properties: {
-                  exactWording: { type: Type.STRING },
+                  exactOriginalWording: { type: Type.STRING },
                   reason: { type: Type.STRING },
-                  replacement: { type: Type.STRING },
+                  replacementWording: { type: Type.STRING },
+                  isFullySupported: { type: Type.BOOLEAN },
                 },
-                required: ["exactWording", "reason", "replacement"],
+                required: ["exactOriginalWording", "reason", "replacementWording", "isFullySupported"],
               },
             },
-            headlineRecommendations: {
+            consistencyReport: {
               type: Type.OBJECT,
               properties: {
-                options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                critique: { type: Type.STRING },
-                insufficientDataNotice: { type: Type.STRING },
-              },
-              required: ["options"],
-            },
-            rewrittenAbout: {
-              type: Type.OBJECT,
-              properties: {
-                copyReadyVersion: { type: Type.STRING },
-                missingDetails: { type: Type.ARRAY, items: { type: Type.STRING } },
-              },
-              required: ["copyReadyVersion", "missingDetails"],
-            },
-            experienceRewrites: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  companyName: { type: Type.STRING },
-                  jobTitle: { type: Type.STRING },
-                  dates: { type: Type.STRING },
-                  copyReadyVersion: { type: Type.STRING },
-                  missingInformation: { type: Type.ARRAY, items: { type: Type.STRING } },
-                },
-                required: [
-                  "companyName",
-                  "jobTitle",
-                  "dates",
-                  "copyReadyVersion",
-                  "missingInformation",
-                ],
-              },
-            },
-            skillsReview: {
-              type: Type.OBJECT,
-              properties: {
-                explicitlyPresent: { type: Type.ARRAY, items: { type: Type.STRING } },
-                unclearOrNeedVerification: { type: Type.ARRAY, items: { type: Type.STRING } },
-                notAvailableNotice: { type: Type.STRING },
-              },
-              required: ["explicitlyPresent", "unclearOrNeedVerification", "notAvailableNotice"],
-            },
-            certificationReview: {
-              type: Type.OBJECT,
-              properties: {
-                certifications: {
+                consistentInformation: { type: Type.ARRAY, items: { type: Type.STRING } },
+                inconsistentInformation: { type: Type.ARRAY, items: { type: Type.STRING } },
+                missingInformation: { type: Type.ARRAY, items: { type: Type.STRING } },
+                conflictingInformation: {
                   type: Type.ARRAY,
                   items: {
                     type: Type.OBJECT,
                     properties: {
-                      name: { type: Type.STRING },
-                      issuer: { type: Type.STRING },
-                      date: { type: Type.STRING },
-                      credentialId: { type: Type.STRING },
+                      field: { type: Type.STRING },
+                      sourceA: {
+                        type: Type.OBJECT,
+                        properties: { name: { type: Type.STRING }, claim: { type: Type.STRING } },
+                        required: ["name", "claim"],
+                      },
+                      sourceB: {
+                        type: Type.OBJECT,
+                        properties: { name: { type: Type.STRING }, claim: { type: Type.STRING } },
+                        required: ["name", "claim"],
+                      },
+                      statement: { type: Type.STRING },
                     },
-                    required: ["name", "issuer", "date", "credentialId"],
+                    required: ["field", "sourceA", "sourceB", "statement"],
                   },
                 },
-                missingDetailsNote: { type: Type.STRING },
               },
-              required: ["certifications"],
+              required: ["consistentInformation", "inconsistentInformation", "missingInformation", "conflictingInformation"],
             },
-            documentContentSuggestions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  topic: { type: Type.STRING },
-                  sourceSubject: { type: Type.STRING },
-                  reasoning: { type: Type.STRING },
-                },
-                required: ["topic", "sourceSubject", "reasoning"],
-              },
+            drafts: {
+              type: Type.OBJECT,
+              description: "Drafts across supported platforms with character counts",
             },
-            finalAccuracyChecklist: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-            finalResponseStatement: { type: Type.STRING },
+            finalStatement: { type: Type.STRING },
           },
           required: [
             "sourceIntegrity",
             "executiveSummary",
-            "factsFound",
+            "sourceBySourceReviews",
             "keep",
             "improve",
             "removeOrReplace",
-            "headlineRecommendations",
-            "rewrittenAbout",
-            "experienceRewrites",
-            "skillsReview",
-            "certificationReview",
-            "documentContentSuggestions",
-            "finalAccuracyChecklist",
-            "finalResponseStatement",
+            "consistencyReport",
+            "drafts",
+            "finalStatement",
           ],
         },
       },
     });
 
-    let auditData: AuditReport | null = null;
-    try {
-      let rawText = response?.text || "{}";
-      rawText = rawText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
-      auditData = JSON.parse(rawText);
-    } catch (parseErr) {
-      console.warn("Could not parse LLM response as JSON, falling back to strict heuristic audit:", parseErr);
-      auditData = generateStrictHeuristicAudit(input, extractedFileText);
+    const text = response.text;
+    if (!text) {
+      throw new Error("Empty response received from AI model.");
     }
 
-    if (!auditData || !auditData.executiveSummary) {
-      auditData = generateStrictHeuristicAudit(input, extractedFileText);
+    const parsed = JSON.parse(text);
+
+    // Enforce exact statement strings
+    parsed.sourceIntegrity.statement =
+      "This analysis uses only the uploaded documents, pasted content, user-provided information, and successfully connected official accounts. No mock data, external search data, guessed facts, or unverified information was used.";
+
+    parsed.finalStatement =
+      "Before publishing, verify every edited sentence against your real experience. This application does not add, confirm, or publish information that was not provided by you or retrieved through an authorized official account connection.";
+
+    if (!parsed.executiveSummary.scoreDisclaimer) {
+      parsed.executiveSummary.scoreDisclaimer =
+        "This score evaluates writing quality, clarity, completeness, and presentation. It must not predict employment, business, or networking results.";
     }
 
-    // Ensure sourceIntegrity document fields match actual upload
-    auditData.sourceIntegrity.documentFilename = uploadedFileName;
-    auditData.sourceIntegrity.documentType = uploadedFileType || (isPdf ? "PDF Document" : "Text Document");
-    auditData.sourceIntegrity.successfullyRead = true;
-    if (profileUrl) {
-      auditData.sourceIntegrity.profileUrlReference = profileUrl;
+    // Auto calculate character counts for drafts if missing
+    if (parsed.drafts) {
+      if (parsed.drafts.linkedin?.headline) {
+        parsed.drafts.linkedin.headline.charCount = parsed.drafts.linkedin.headline.text?.length || 0;
+        parsed.drafts.linkedin.headline.maxChars = 220;
+      }
+      if (parsed.drafts.linkedin?.about) {
+        parsed.drafts.linkedin.about.charCount = parsed.drafts.linkedin.about.text?.length || 0;
+        parsed.drafts.linkedin.about.maxChars = 2600;
+      }
+      if (parsed.drafts.instagram?.displayName) {
+        parsed.drafts.instagram.displayName.charCount = parsed.drafts.instagram.displayName.text?.length || 0;
+        parsed.drafts.instagram.displayName.maxChars = 30;
+      }
+      if (parsed.drafts.instagram?.bio) {
+        parsed.drafts.instagram.bio.charCount = parsed.drafts.instagram.bio.text?.length || 0;
+        parsed.drafts.instagram.bio.maxChars = 150;
+      }
+      if (parsed.drafts.twitter?.displayName) {
+        parsed.drafts.twitter.displayName.charCount = parsed.drafts.twitter.displayName.text?.length || 0;
+        parsed.drafts.twitter.displayName.maxChars = 50;
+      }
+      if (parsed.drafts.twitter?.bio) {
+        parsed.drafts.twitter.bio.charCount = parsed.drafts.twitter.bio.text?.length || 0;
+        parsed.drafts.twitter.bio.maxChars = 160;
+      }
+      if (parsed.drafts.tiktok?.displayName) {
+        parsed.drafts.tiktok.displayName.charCount = parsed.drafts.tiktok.displayName.text?.length || 0;
+        parsed.drafts.tiktok.displayName.maxChars = 30;
+      }
+      if (parsed.drafts.tiktok?.bio) {
+        parsed.drafts.tiktok.bio.charCount = parsed.drafts.tiktok.bio.text?.length || 0;
+        parsed.drafts.tiktok.bio.maxChars = 80;
+      }
+      if (parsed.drafts.github?.bio) {
+        parsed.drafts.github.bio.charCount = parsed.drafts.github.bio.text?.length || 0;
+        parsed.drafts.github.bio.maxChars = 160;
+      }
     }
 
-    // Generate markdown and plain text representations
-    auditData.markdownReport = buildMarkdownReport(auditData);
-    auditData.plainTextReport = buildPlainTextReport(auditData);
+    const auditResult: CareerPortfolioAuditResult = {
+      id: "audit_" + Date.now(),
+      createdAt: new Date().toISOString(),
+      ...parsed,
+      markdownReport: "",
+      plainTextReport: "",
+    };
 
-    res.json(auditData);
+    auditResult.markdownReport = generateMarkdownReport(auditResult);
+    auditResult.plainTextReport = generatePlainTextReport(auditResult);
+
+    res.json(auditResult);
   } catch (err: any) {
-    const errorDetail = typeof err === "object" ? (err?.message || JSON.stringify(err)) : String(err);
-    console.warn("Upstream model saturated or error encountered. Generating strict heuristic audit fallback:", errorDetail.slice(0, 150));
-    try {
-      const extractedFileText = await extractDocumentText(
-        input.uploadedFileName || "",
-        input.uploadedFileType || "",
-        Buffer.from(input.uploadedFileBase64 || "", "base64")
-      );
-      const fallbackAudit = generateStrictHeuristicAudit(input, extractedFileText);
-      res.json(fallbackAudit);
-    } catch (fallbackErr: any) {
-      res.status(500).json({
-        error: "I could not read this document. Please upload a clear PDF, DOCX, or TXT file containing your LinkedIn profile.",
-      });
-    }
+    console.error("Analysis execution error:", err);
+    res.status(500).json({
+      error: err?.message || "Failed to generate portfolio audit. Please verify your uploaded sources and try again.",
+    });
   }
 });
 
-// Start Express server and mount Vite
+// Mock OAuth/API connection status endpoint - Enforces real connection rules
+app.post("/api/account-connect/:platform", async (req: Request, res: Response) => {
+  const { platform } = req.params;
+
+  // Rule: Do not show connected unless authorized
+  // Return honest notice that direct automated update requires official OAuth token
+  res.json({
+    platform,
+    status: "not_connected",
+    notice: "This platform cannot be updated automatically through an authorized connection. You can upload or paste the profile content, and the application will prepare an exact copy-ready update for you.",
+  });
+});
+
+// Vite & Static file handler
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -576,7 +576,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`LinkedIn Profile Pro server running on http://0.0.0.0:${PORT}`);
+    console.log(`Career Portfolio Pro server running on http://0.0.0.0:${PORT}`);
   });
 }
 

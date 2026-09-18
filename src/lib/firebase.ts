@@ -6,6 +6,9 @@ import {
   signOut, 
   onAuthStateChanged, 
   updateProfile,
+  signInWithPopup,
+  GoogleAuthProvider,
+  signInAnonymously,
   User as FirebaseUser 
 } from "firebase/auth";
 import { 
@@ -51,6 +54,9 @@ testFirebaseConnection();
 export {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
+  signInAnonymously,
   signOut,
   onAuthStateChanged,
   updateProfile,

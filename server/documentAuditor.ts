@@ -1,8 +1,6 @@
-import { createRequire } from "module";
 import mammoth from "mammoth";
+import { PDFParse } from "pdf-parse";
 import { AuditReport, UserInput } from "../src/types";
-
-const require = createRequire(import.meta.url);
 
 /**
  * Extracts raw text from uploaded document (PDF, DOCX, or TXT)
@@ -33,20 +31,14 @@ export async function extractDocumentText(
   // PDF Document
   if (lowerName.endsWith(".pdf") || mimetype === "application/pdf") {
     try {
-      const pdfModule = require("pdf-parse");
-      if (pdfModule.PDFParse) {
-        const parser = new pdfModule.PDFParse({ data: buffer });
+      if (typeof PDFParse === "function") {
+        const parser = new (PDFParse as any)({ data: buffer });
         if (typeof parser.getText === "function") {
           const res = await parser.getText();
           await parser.destroy?.();
           if (res && res.text) {
             return res.text;
           }
-        }
-      } else if (typeof pdfModule === "function") {
-        const data = await pdfModule(buffer);
-        if (data && data.text) {
-          return data.text;
         }
       }
     } catch (pdfErr: any) {

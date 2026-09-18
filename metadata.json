@@ -1,6 +1,6 @@
 {
-  "name": "LinkedIn Profile Pro",
-  "description": "Professional LinkedIn profile document audit application analyzing only verified uploaded document records to provide rigorous keep, improve, add, remove, and rewrite guidance.",
+  "name": "Career Portfolio Pro",
+  "description": "Professional multi-platform online presence audit, cross-platform consistency engine, and draft publisher supporting LinkedIn, Instagram, X/Twitter, GitHub, CV/resumes, and portfolios under strict source-of-truth verification.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
